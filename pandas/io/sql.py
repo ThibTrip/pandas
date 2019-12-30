@@ -467,10 +467,15 @@ def to_sql(
     schema : str, optional
         Name of SQL schema in database to write to (if database flavor
         supports this). If None, use default schema (default).
-    if_exists : {'fail', 'replace', 'append'}, default 'fail'
+    if_exists : {'fail', 'replace', 'append', 'upsert_overwrite', 'upsert_keep'},
+        default 'fail'.
         - fail: If table exists, do nothing.
         - replace: If table exists, drop it, recreate it, and insert data.
         - append: If table exists, insert data. Create if does not exist.
+        - upsert_overwrite: If table exists, perform an UPSERT (based on primary keys),
+                prioritising incoming records over duplicates already in the database.
+        - upsert_keep: If table exists, perform an UPSERT (based on primary keys),
+                prioritising records already in the database over incoming duplicates.
     index : boolean, default True
         Write DataFrame index as a column.
     index_label : str or sequence, optional
@@ -497,7 +502,13 @@ def to_sql(
 
         .. versionadded:: 0.24.0
     """
-    if if_exists not in ("fail", "replace", "append"):
+    if if_exists not in (
+        "fail",
+        "replace",
+        "append",
+        "upsert_keep",
+        "upsert_overwrite",
+    ):
         raise ValueError("'{0}' is not valid for if_exists".format(if_exists))
 
     pandas_sql = pandasSQL_builder(con, schema=schema)
@@ -649,7 +660,7 @@ class SQLTable(PandasObject):
             elif self.if_exists == "replace":
                 self.pd_sql.drop_table(self.name, self.schema)
                 self._execute_create()
-            elif self.if_exists == "append":
+            elif self.if_exists in {"append", "upsert_overwrite", "upsert_keep"}:
                 pass
             else:
                 raise ValueError(
@@ -657,6 +668,104 @@ class SQLTable(PandasObject):
                 )
         else:
             self._execute_create()
+
+    def _upsert_overwrite_processing(self):
+        """
+        Generate delete statement for rows with clashing primary key from database.
+
+        `upsert_overwrite` prioritizes incoming data, over existing data in the DB.
+        This method generates the Delete statement for duplicate rows,
+        which is to be executed in the same transaction as the ensuing data insert.
+
+        Returns
+        ----------
+        sqlalchemy.sql.dml.Delete
+            Delete statement to be executed against DB
+        """
+        from sqlalchemy import tuple_
+
+        # Primary key data
+        primary_keys, primary_key_values = self._get_primary_key_data()
+        # Generate delete statement
+        delete_statement = self.table.delete().where(
+            tuple_(*(self.table.c[col] for col in primary_keys)).in_(primary_key_values)
+        )
+        return delete_statement
+
+    def _upsert_keep_processing(self):
+        """
+        Delete clashing values from a copy of the incoming dataframe.
+
+        `upsert_keep` prioritizes data in DB over incoming data.
+        This method creates a copy of the incoming dataframe,
+        fetches matching data from DB, deletes matching data from copied frame,
+        and returns that frame to be inserted.
+
+        Returns
+        ----------
+        DataFrame
+            Filtered dataframe, with values that are already in DB removed.
+        """
+        from sqlalchemy import tuple_, select
+
+        # Primary key data
+        primary_keys, primary_key_values = self._get_primary_key_data()
+        # Fetch matching pkey values from database
+        columns_to_fetch = [self.table.c[key] for key in primary_keys]
+        select_statement = select(columns_to_fetch).where(
+            tuple_(*columns_to_fetch).in_(primary_key_values)
+        )
+        pkeys_from_database = _wrap_result(
+            data=self.pd_sql.execute(select_statement), columns=primary_keys
+        )
+        # Get temporary dataframe so as not to delete values from main df
+        temp = self._get_index_formatted_dataframe()
+        # Delete rows from dataframe where primary keys match
+        # Method requires tuples, to account for cases where indexes do not match
+        to_be_deleted_mask = (
+            temp[primary_keys]
+            .apply(tuple, axis=1)
+            .isin(pkeys_from_database[primary_keys].apply(tuple, axis=1))
+        )
+        temp.drop(temp[to_be_deleted_mask].index, inplace=True)
+
+        return temp
+
+    def _get_primary_key_data(self):
+        """
+        Get primary keys from database, and yield dataframe columns with same names.
+
+        Upsert workflows require knowledge of what is already in the database.
+        This method reflects the meta object and gets a list of primary keys,
+        it then returns all columns from the incoming dataframe with names matching
+        these keys.
+
+        Returns
+        -------
+        primary_keys : list of str
+            Primary key names
+        primary_key_values : iterable
+            DataFrame rows, for columns corresponding to `primary_key` names
+        """
+        # reflect MetaData object and assign contents of db to self.table attribute
+        self.pd_sql.meta.reflect(only=[self.name], views=True)
+        self.table = self.pd_sql.get_table(table_name=self.name, schema=self.schema)
+
+        primary_keys = [
+            str(primary_key.name)
+            for primary_key in self.table.primary_key.columns.values()
+        ]
+
+        # For the time being, this method is defensive and will break if
+        # no pkeys are found. If desired this default behaviour could be
+        # changed so that in cases where no pkeys are found,
+        # it could default to a normal insert
+        if len(primary_keys) == 0:
+            raise ValueError(f"No primary keys found for table {self.name}")
+
+        temp = self._get_index_formatted_dataframe()
+        primary_key_values = zip(*[temp[key] for key in primary_keys])
+        return primary_keys, primary_key_values
 
     def _execute_insert(self, conn, keys, data_iter):
         """Execute SQL statement inserting data
@@ -682,21 +791,36 @@ class SQLTable(PandasObject):
         data = [dict(zip(keys, row)) for row in data_iter]
         conn.execute(self.table.insert(data))
 
-    def insert_data(self):
+    def _get_index_formatted_dataframe(self):
+        """
+        Format index of incoming dataframe to be aligned with a database table.
+
+        Copy original dataframe, and check whether the dataframe index
+        is to be added to the database table.
+        If it is, reset the index so that it becomes a normal column, else return
+
+        Returns
+        -------
+        DataFrame
+        """
+        # Originally this functionality formed the first step of the insert_data method.
+        # It will be useful to have in other places, so moved here to keep code DRY.
+        temp = self.frame.copy()
         if self.index is not None:
-            temp = self.frame.copy()
             temp.index.names = self.index
             try:
                 temp.reset_index(inplace=True)
             except ValueError as err:
                 raise ValueError("duplicate name in index/columns: {0}".format(err))
-        else:
-            temp = self.frame
 
-        column_names = list(map(str, temp.columns))
+        return temp
+
+    @staticmethod
+    def insert_data(data):
+        column_names = list(map(str, data.columns))
         ncols = len(column_names)
         data_list = [None] * ncols
-        blocks = temp._data.blocks
+        blocks = data._data.blocks
 
         for b in blocks:
             if b.is_datetime:
@@ -723,7 +847,21 @@ class SQLTable(PandasObject):
         return column_names, data_list
 
     def insert(self, chunksize=None, method=None):
+        """
+        Determines what data to pass to the underlying insert method.
+        """
+        with self.pd_sql.run_transaction() as trans:
+            if self.if_exists == "upsert_keep":
+                data = self._upsert_keep_processing()
+                self._insert(data=data, chunksize=chunksize, method=method, conn=trans)
+            elif self.if_exists == "upsert_overwrite":
+                delete_statement = self._upsert_overwrite_processing()
+                trans.execute(delete_statement)
+                self._insert(chunksize=chunksize, method=method, conn=trans)
+            else:
+                self._insert(chunksize=chunksize, method=method, conn=trans)
 
+    def _insert(self, data=None, chunksize=None, method=None, conn=None):
         # set insert method
         if method is None:
             exec_insert = self._execute_insert
@@ -734,9 +872,12 @@ class SQLTable(PandasObject):
         else:
             raise ValueError("Invalid parameter `method`: {}".format(method))
 
-        keys, data_list = self.insert_data()
+        if data is None:
+            data = self._get_index_formatted_dataframe()
 
-        nrows = len(self.frame)
+        keys, data_list = self.insert_data(data=data)
+
+        nrows = len(data)
 
         if nrows == 0:
             return
@@ -748,15 +889,14 @@ class SQLTable(PandasObject):
 
         chunks = int(nrows / chunksize) + 1
 
-        with self.pd_sql.run_transaction() as conn:
-            for i in range(chunks):
-                start_i = i * chunksize
-                end_i = min((i + 1) * chunksize, nrows)
-                if start_i >= end_i:
-                    break
+        for i in range(chunks):
+            start_i = i * chunksize
+            end_i = min((i + 1) * chunksize, nrows)
+            if start_i >= end_i:
+                break
 
-                chunk_iter = zip(*[arr[start_i:end_i] for arr in data_list])
-                exec_insert(conn, keys, chunk_iter)
+            chunk_iter = zip(*[arr[start_i:end_i] for arr in data_list])
+            exec_insert(conn, keys, chunk_iter)
 
     def _query_iterator(
         self, result, chunksize, columns, coerce_float=True, parse_dates=None
@@ -1263,10 +1403,15 @@ class SQLDatabase(PandasSQL):
         frame : DataFrame
         name : string
             Name of SQL table.
-        if_exists : {'fail', 'replace', 'append'}, default 'fail'
-            - fail: If table exists, do nothing.
-            - replace: If table exists, drop it, recreate it, and insert data.
-            - append: If table exists, insert data. Create if does not exist.
+        if_exists : {'fail', 'replace', 'append', 'upsert_overwrite', 'upsert_keep'},
+        default 'fail'.
+        - fail: If table exists, do nothing.
+        - replace: If table exRsts, drop it, recreate it, and insert data.
+        - append: If table exists, insert data. Create if does not exist.
+        - upsert_overwrite: If table exists, perform an UPSERT (based on primary keys),
+                prioritising incoming records over duplicates already in the database.
+        - upsert_keep: If table exists, perform an UPSERT (based on primary keys),
+                prioritising records already in the database over incoming duplicates.
         index : boolean, default True
             Write DataFrame index as a column.
         index_label : string or sequence, default None
